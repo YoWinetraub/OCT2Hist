@@ -1,0 +1,138 @@
+//This Jenkinsfile will preform a scan and save the results to a common storage
+//It will also create a .m file explaining how to preprocess this scan
+pipeline {
+	agent any
+	environment {
+        TEMP_STORAGE = "F:\\Jenkins\\TempDataStorage\\"
+    	CREDENTIALS_PATH = "F:\\Jenkins\\"
+		IS_REMOVE_TEMP_STORAGE_WHEN_DONE = "false"
+	}
+	options {
+		buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30')) //Discard old builds
+  	}
+	stages{
+		stage("Checkout")
+		{steps{script{
+			//Figure out which branch Jenkinsfile was checked out, we will checkout the same one
+			def gitTxt
+			try
+			{
+				bat "git describe --tags --exact-match > commandResult.txt" 
+				gitTxt = readFile('commandResult.txt').trim()
+				echo gitTxt
+				if (gitTxt.contains("fatal: No tags can describe"))
+				{
+					gitTxt = "master"
+				}
+			}
+			catch(Exception e)
+			{ 
+				// Couldn't find exact match, its actually we look at the master
+				gitTxt = "master"
+			}
+			
+			branch = gitTxt
+			echo("Jenkins Build #: " + env.BUILD_NUMBER)
+			echo("Fetching: " + branch)
+			
+			//Identify where github is installed
+			def gitFolderOption1 = new File("C:\\Program Files (x86)\\Git\\cmd\\")
+			def gitFolderOption2 = new File("C:\\Program Files\\Git\\cmd\\")
+			def gitFolder = ""
+			if (gitFolderOption1.exists()) {
+				gitFolder = gitFolderOption1.absolutePath
+			} else if (gitFolderOption2.exists()) {
+				gitFolder = gitFolderOption2.absolutePath
+			} else {
+				error "Clould not find git in the known possible possitions"
+			}
+			gitFolder = gitFolder + "\\"
+			
+			//Checkout a fresh copy 
+			cleanWs()
+			bat('"' + gitFolder + 'git.exe" clone --branch "' + branch + '" --single-branch "https://github.com/MyYo/HashtagAlignment.git"') //Checkout HashtagAlignment
+			bat('"' + gitFolder + 'git.exe" clone --branch "' + branch + '" --single-branch "https://github.com/MyYo/myOCT.git"') //Checkout myOCT
+			
+			//Make note of the repository version
+			bat('@cd HashtagAlignment && @"' + gitFolder + 'git.exe" rev-parse HEAD > ..\\commandResult.txt')
+			def hashtagAlignmentVer = readFile('commandResult.txt').trim()
+			bat('@cd myOCT && @"' + gitFolder + 'git.exe" rev-parse HEAD > ..\\commandResult.txt')
+			def myOCTVer = readFile('commandResult.txt').trim()
+			
+			//Move files to main folder
+			bat('@xcopy /E HashtagAlignment . /Y /Q')
+			bat('@xcopy /E myOCT . /Y /Q')
+			bat('@copy "%CREDENTIALS_PATH%\\*.m" .')
+			
+			//Delete folder used for checkout
+			bat('@rmdir HashtagAlignment /S /Q')
+			bat('@rmdir myOCT /S /Q')
+			
+			//Start buidling the runme file
+			bat("@echo disp('HashtagAlignment Git Hash: " + hashtagAlignmentVer + "');  >> runme.m")
+			bat("@echo disp('myOCT Git Hash: " + myOCTVer + "');  >> runme.m")
+			bat("@echo disp('To see repository go to');  >> runme.m")
+			bat("@echo disp('https://github.com/MyYo/HashtagAlignment/tree/" + hashtagAlignmentVer + "'); >> runme.m")
+			bat("@echo disp('https://github.com/MyYo/myOCT/tree/"            + myOCTVer + "'); >> runme.m")
+		}}}
+		stage("Build Runme File and Run Matlab")
+		{steps{script{
+			bat("@echo isRunInAutomatedMode_ = true; >> runme.m")
+			
+			def runmePreprocessFP = env.TEMP_STORAGE + '\\runme_preprocess.m'
+			def f = new File( runmePreprocessFP )
+			if( f.exists() ) 
+			{
+				bat('@type "' + runmePreprocessFP + '" >> runme.m') //Copy main file to run locally
+			} else {
+				currentBuild.result = 'ABORTED'
+				echo("No files to process, runme_preprocess.m does not exist")
+				error("No files to process, runme_preprocess.m does not exist")
+			}
+			
+			RunMatlabRunme()
+			
+			//Delete preprocess file, we are done
+			File file = new File(env.TEMP_STORAGE + "\\runme_preprocess.m")
+			if (file.exists()){
+				file.delete();
+			}  
+			currentBuild.result = "SUCCESS"
+		}}}
+		stage("Delete Temp Storage?")
+		{steps{script{
+			if (currentBuild.result == "SUCCESS")
+			{
+				if (env.IS_REMOVE_TEMP_STORAGE_WHEN_DONE == "true")
+				{
+					echo "Removing everything in temp storage directory"
+					bat('rmdir "%TEMP_STORAGE%" /S /Q')
+					bat('mkdir "%TEMP_STORAGE%"')
+				}
+				else
+				{
+					echo "IS_REMOVE_TEMP_STORAGE_WHEN_DONE requests that we don't delete Temp Storage, skipping"
+				}
+			}
+		}}}
+	}
+}
+def LOG_OUTPUT_FOLDER()
+{
+	return  "${TEMP_STORAGE}\\${SUBJECT_ID}\\Log\\02 OCT Preprocess Log\\"
+}
+def RunMatlabRunme() //runs runme.m
+{
+	try
+	{
+		def rootDir = pwd()
+		def MatlabRunner = load "${rootDir}/98 Jenkins Lib/MatlabRunner.Groovy"
+		MatlabRunner.RunMatlabScript ("runme.m");
+		bat("@del \f runme.m");
+	}
+	catch(Exception e)
+	{
+		currentBuild.result = 'FAILURE'
+		throw("Matlab Failed")
+	}
+}

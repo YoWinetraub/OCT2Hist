@@ -1,0 +1,475 @@
+//This Jenkinsfile will preform a scan and save the results to a common storage
+//It will also create a .m file explaining how to preprocess this scan
+pipeline {
+	agent any
+	environment {
+        TEMP_STORAGE = "F:\\Jenkins\\TempDataStorage\\"
+    	CREDENTIALS_PATH = "F:\\Jenkins\\"
+	}
+	options {
+		buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '100')) //Discard old builds
+  	}
+	parameters 
+	{
+		string(
+			name: "S3_DIR",
+			defaultValue:"s3://delazerdamatlab/Users/OCTHistologyLibrary/LH/",
+			description:"Subject Directory.\nExample: s3://delazerdamatlab/Users/OCTHistologyLibrary/LH/",
+			trim: true)
+		string(
+			name: "SAMPLE_ID",
+			defaultValue:"LH-00",
+			description:"Subject Id.\nExample: LH-01",
+			trim: true)
+		string(
+			name: "Z_POSITION_TOP_OF_GEL_UM",
+			defaultValue:"-300",
+			description:"We assume top of the sample is in focus right now.\nSet this value to the position of the top of the gel (code will photobleach just under top of gel) z.\nUnits are um | +z is deeper",
+			trim: true)
+		string(
+			name: "WHO_TO_EMAIL_WHEN_DONE",
+			defaultValue:"@stanford.edu",
+			description:"Who should get an email with the results? Including you!\nUse comma to specify multiple emails.\nExample: me@stanford.edu, you@stanford.edu",
+			trim: true)
+			
+		booleanParam(
+			name: 'IS_FRESH_HUMAN_SAMPLE',
+			defaultValue:false,
+			description:"Is this a fresh human sample?")
+		
+		string(
+			name: "SAME_PATIENT_AS_SAMPLE_ID",
+			defaultValue:"New Patient",
+			description:"If this sample is from the same patient as another sample specify here. For example LH-01.\nIf this sample is from a patient that wasn't scanned before, leave as 'New Patient'",
+			trim: true)
+		
+		string(
+			name: "AGE",
+			defaultValue:"",
+			description:"Subject's Age",
+			trim: true)
+		choice(
+			name: "GENDER",
+			choices: ['Unknown', 'Male', 'Female'],
+			description:"Subject's Gender"
+			)
+		string(
+			name: "SAMPLE_LOCATION",
+			defaultValue:"Unknown",
+			description:"Forearm, Shin etc",
+			trim: true)
+		string(
+			name: "SIDE",
+			defaultValue:"Unknown",
+			description:"Left, Right, Dorsal etc",
+			trim: true)
+		string(
+			name: "POSSIBLE_PATIENT_DIAGNOSIS",
+			defaultValue:"Unknown",
+			description:"BCC, SCC etc",
+			trim: true)
+		choice(
+			name: "HEALTHY_OR_TUMOR",
+			choices: ['Healthy','Tumor','Margin','Unknown'],
+			description:"If this sample is 'dog ear' choose healthy. If inside the core of the tumor choose 'Tumor'"
+			)
+		choice(
+			name: "SKIN_TYPE",
+			choices: ['Unknown','1','2','3','4','5','6'],
+			description:"Fitzpatrick Skin Type"
+			)		
+		
+		//Debug purpose 
+		booleanParam(
+			name: 'IS_PHOTOBLEACH_TICKMARKS',
+			defaultValue:false,
+			description:"Set to true if you would like to photobleach tickmarks")
+		booleanParam(
+			name: 'IS_DEBUG_MODE',
+			defaultValue:false,
+			description:"Set to true if you would like to do a fast debug scan")
+		string(
+			name: "CODE_TO_RUN_BEFORE_RUNNING_MAIN_SCRIPT",
+			defaultValue:"",
+			description:"Will run the code above before running the main matlab script. Use this string to set parameters. Keep empty if no additional parameters are set.\n" + 
+				"For example, to run just a few z stacs, use this code:\n" + 
+				"zToScan_ = (([-190,5,500])-5)*1e-3; overview_rangeAllX_=5; overview_rangeAllY_=4; overview_nZToScan_ = 2;",
+			trim: true)
+    }
+	stages{
+		stage("Checkout")
+		{steps{script{
+			//Figure out which branch Jenkinsfile was checked out, we will checkout the same one
+			def gitTxt
+			try
+			{
+				bat "git describe --tags --exact-match > commandResult.txt" 
+				gitTxt = readFile('commandResult.txt').trim()
+				echo gitTxt
+				if (gitTxt.contains("fatal: No tags can describe"))
+				{
+					gitTxt = "master"
+				}
+			}
+			catch(Exception e)
+			{ 
+				// Couldn't find exact match, its actually we look at the master
+				gitTxt = "master"
+			}
+			
+			branch = gitTxt
+			echo("Jenkins Build #: " + env.BUILD_NUMBER)
+			echo("Fetching: " + branch)
+			
+			//Identify where github is installed
+			def gitFolderOption1 = new File("C:\\Program Files (x86)\\Git\\cmd\\")
+			def gitFolderOption2 = new File("C:\\Program Files\\Git\\cmd\\")
+			def gitFolder = ""
+			if (gitFolderOption1.exists()) {
+				gitFolder = gitFolderOption1.absolutePath
+			} else if (gitFolderOption2.exists()) {
+				gitFolder = gitFolderOption2.absolutePath
+			} else {
+				error "Clould not find git in the known possible possitions"
+			}
+			gitFolder = gitFolder + "\\"
+			
+			//Checkout a fresh copy 
+			cleanWs()
+			bat('"' + gitFolder + 'git.exe" clone --branch "' + branch + '" --single-branch "https://github.com/MyYo/HashtagAlignment.git"') //Checkout HashtagAlignment
+			bat('"' + gitFolder + 'git.exe" clone --branch "' + branch + '" --single-branch "https://github.com/MyYo/myOCT.git"') //Checkout myOCT
+			
+			//Make note of the repository version
+			bat('@cd HashtagAlignment && @"' + gitFolder + 'git.exe" rev-parse HEAD > ..\\commandResult.txt')
+			def hashtagAlignmentVer = readFile('commandResult.txt').trim()
+			bat('@cd myOCT && @"' + gitFolder + 'git.exe" rev-parse HEAD > ..\\commandResult.txt')
+			def myOCTVer = readFile('commandResult.txt').trim()
+			
+			//Move files to main folder
+			bat('@xcopy /E HashtagAlignment . /Y /Q')
+			bat('@xcopy /E myOCT . /Y /Q')
+			bat('@copy "%CREDENTIALS_PATH%\\*.m" .')
+			
+			//Delete folder used for checkout
+			bat('@rmdir HashtagAlignment /S /Q')
+			bat('@rmdir myOCT /S /Q')
+			
+			//Start buidling the runme file
+			bat("@echo disp('HashtagAlignment Git Hash: " + hashtagAlignmentVer + "');  >> runme.m")
+			bat("@echo disp('https://github.com/MyYo/HashtagAlignment/tree/" + hashtagAlignmentVer + "'); >> runme.m")
+			bat("@echo disp('https://github.com/MyYo/myOCT/tree/"            + myOCTVer + "'); >> runme.m")
+			bat("@echo gitBranch_ = '" + branch + "'; >> runme.m")
+		}}}
+		stage("Parameters Check and Env Setup") 
+		{steps{script{
+		
+			echo "Tmp Save of Log File"
+			BackupLogFile(); //Save the log file here just because this tends to fail the firt time you run it due to permissions. So put it at the begining as safety measure
+			
+			echo "Input checks"
+			if (IS_DEBUG_MODE == "false") // Checks apply only for operational mode
+			{
+				if (params.WHO_TO_EMAIL_WHEN_DONE == "@stanford.edu") 
+				{
+					currentBuild.result = 'ABORTED'
+					echo('Please specify email address to send a note when run is completed')
+					error('Please specify email address to send a note when run is completed')
+				}
+				
+				if (IS_FRESH_HUMAN_SAMPLE == "true")
+				{
+					//This is a fresh human sample make sure we have data about it
+					if (params.PATIENT_AGE == "" && params.SAME_PATIENT_AS_SAMPLE_ID == "New Patient")
+					{
+						currentBuild.result = 'ABORTED'
+						echo('Please specify patient data')
+						error('Please specify patient data')
+					}
+				}
+			}
+		}}}
+		stage("Build Files")
+		{steps{script{
+			bat("@echo isDebugFastMode_ = %IS_DEBUG_MODE%; >> runme.m")
+			bat("@echo zGelTop_mm_=%Z_POSITION_TOP_OF_GEL_UM%/1000; >> runme.m") //Matlab works in mm, Z_POSITION_TOP_OF_GEL_UM is in um here
+			bat("@echo outputFolder_='" + VOLUME_OUTPUT_FOLDER() + "'; >> runme.m")
+			bat("@echo isDrawTickmarks_=%IS_PHOTOBLEACH_TICKMARKS%; >> runme.m")
+			bat("@echo ; %CODE_TO_RUN_BEFORE_RUNNING_MAIN_SCRIPT% >> runme.m")
+			bat("@echo run ScanAndPattern_Thorlabs.m  >> runme.m")
+				
+			//Make a folder for the log
+			def folder3 = new File(LOG_OUTPUT_FOLDER())
+			if (!folder3.exists()) {
+				bat ('mkdir "' + LOG_OUTPUT_FOLDER() + '"');
+			}
+			
+			//Make volume dir if it doesnt exist yet and copy JSON file there
+			def folder4 = new File(VOLUME_OUTPUT_FOLDER())
+			if (!folder4.exists()) {
+				bat('mkdir "' + VOLUME_OUTPUT_FOLDER() + '"');
+			}
+						
+			//Make note of the parameters we learned from input - Regarding the volume
+			def str = params.WHO_TO_EMAIL_WHEN_DONE;
+			str = str.substring(0,str.indexOf('@'))
+			def file = new File(VOLUME_OUTPUT_FOLDER() + "\\ScanConfig.json")
+			file.write ('\u007B "volumeScannedBy" : "' + str + '"\u007D')
+	
+			//Make not of the parameters we learned from input - Regarding the subject (TBD)
+			def file2 = new File(VOLUME_OUTPUT_FOLDER() + "\\..\\Subject.json")
+			file2.write('\u007B\n' + 
+				'"sampleId" : "'                    + params.SAMPLE_ID + '",\n' + 
+				'"isFreshHumanSample" : '           + params.IS_FRESH_HUMAN_SAMPLE + ',\n' +
+				'"samePatientAsSampleWithId" : "'   + params.SAME_PATIENT_AS_SAMPLE_ID + '",\n' +
+				'"age" : "'                         + params.AGE + '",\n' + 
+				'"gender": "'                       + params.GENDER + '",\n' + 
+				'"sampleLocation": "'               + params.SAMPLE_LOCATION + '",\n' + 
+				'"side": "'                         + params.SIDE + '",\n' + 
+				'"possiblePatientDiagnosis": "'     + params.POSSIBLE_PATIENT_DIAGNOSIS + '",\n' + 
+				'"sampleType": "'                   + params.HEALTHY_OR_TUMOR + '",\n' + 
+				'"fitzpatrickSkinType" : "'         + params.SKIN_TYPE + '"\n' + 
+				'\u007D')
+			
+			//Print text 
+			def file3 = new File(VOLUME_OUTPUT_FOLDER() + "\\..\\Subject.json")
+			text = file3.getText('UTF-8')
+			echo ("Subject.json\n------------\n" + text + "\n\n");
+				   
+		}}}
+		stage("Scan And Photobleach")
+		{steps{script{
+		
+			try
+			{
+				RunMatlabRunme();
+			}
+			catch(Exception e)
+			{
+				currentBuild.result = 'FAILURE'
+				throw("Matlab Failed")
+			}
+			finally
+			{
+				//Try archiving everithing
+				try
+				{
+					bat('copy Testers\\matlablog.txt "' + LOG_OUTPUT_FOLDER() + '"')
+					bat('copy Testers\\runme.m "' + LOG_OUTPUT_FOLDER() + '"')
+					bat('copy Testers\\*.png "' + LOG_OUTPUT_FOLDER() + '"')
+					
+					archiveArtifacts allowEmptyArchive: true, artifacts: 'Testers/matlablog.txt, runme.m', caseSensitive: true, defaultExcludes: true, fingerprint: false, onlyIfSuccessful: false
+				}
+				catch(Exception e)
+				{
+					//Do nothing, its ok if a file is missing from the archive
+				}
+			}
+		}}}
+		stage("Leave a Hook for Preprocessing")
+		{steps{script{
+			//How to preprocess this file
+			def foldersDef = 
+				"SubjectFolderIn_  = '%TEMP_STORAGE%\\%SAMPLE_ID%\\';" + 
+				"SubjectFolderOut_ = '%S3_DIR%/%SAMPLE_ID%/';"	
+		
+			//Manualy
+			def currentDir = pwd()
+			bat("""@echo "%MATLAB_PATH%" -r "addpath(genpath('""" + currentDir + "'));" + foldersDef +
+				"isRunInAutomatedMode_ = false; cd('" + currentDir + """\\02 OCT Preprocess\\'); runAllPreprocessing; disp('MAKE SURE YOU QUIT MATLAB BEFORE RUNNING JENKINS!');" > "%TEMP_STORAGE%\\%SAMPLE_ID%_runAllPreprocessing_Manualy.bat" """)
+
+			//Automated, in auto mode dont preprocess before uploading
+			bat("@echo " + foldersDef + """isPreprocess_=false; runAllPreprocessing; >> "%TEMP_STORAGE%\\runme_preprocess.m" """)
+			
+			//println gitFolder
+		}}}
+		stage("Process Overview")
+		{steps{script{
+			//Cereate an m file to process the overview
+			bat ("""
+				@echo off
+				echo OCTVolumesFolder_ = '""" + VOLUME_OUTPUT_FOLDER() + """'; > runme.m
+				echo isRunInAutomatedMode_ = true; >> runme.m
+				echo findFocusInBScan; >> runme.m
+				echo stitchOverview; >> runme.m
+				""")
+				
+			//Create links to where to submit google spreadsheet
+			bat ("""
+				@echo off
+				echo OCTVolumesFolder_ = '""" + VOLUME_OUTPUT_FOLDER() + """'; >> runme.m
+				echo makeLinks; >> runme.m
+				""")
+			
+			RunMatlabRunme();
+			
+		}}}
+		stage("Ask User Input")
+		{steps{script{
+		
+			//Get the links
+			def lk = readFile('Testers\\out.txt').trim()
+		
+			//Notify user that his attention is required
+			try
+			{
+			emailext (
+				subject: "[OCTHist] Scan - Input Requested",
+				from : "Yonatan",
+				body: 
+					"Please go to Jenkins, it requests some inputs before completing<br>"+
+					"<br>"+
+					'To submit sample to the google spreadsheet folow this <a href="' + lk + '">link</a><br>' +
+					"<br>"+
+					'To view interactive log click <a href="' + env.BUILD_URL + '/console">here</a><br>' +
+					"<br>" + 
+					'Examine <a href="' + env.BUILD_URL + '/execution/node/3/ws/Testers/Overview.png">Overview Image</a>.<br>' +
+					'<a href="' + env.BUILD_URL + '/input">Enter Inputs</a>.<br>' + 
+					"<br>" +
+					"Yonatan"
+					,
+				attachLog: true,
+				//attachmentsPattern: "Testers/*.png",
+				to: "$WHO_TO_EMAIL_WHEN_DONE",
+				mimeType: "text/html")
+			}
+			catch(Exception e)
+			{
+				echo ("Could not send an email notifying the person to come and check outputs, its ok, we shall wait!");
+			}
+				
+			//Give instructions
+			echo "- Please review overview image and provide your input:" + "\n" +
+				 "- File:\n\t" + env.BUILD_URL + "execution/node/3/ws/Testers/Overview.png" + "\n"
+
+			//Ask for input
+			def userInput = input( 
+				message: 'Please Provide Parameters', ok: 'Next',
+                parameters: [
+					string(defaultValue: '1500',
+						name: 'HowDeepUM', 
+						description: 'How deep from tissue surface is OCT origin? [microns]\nShortest distance is better'
+						),
+                    choice(
+						name: 'WhichSideToStartSections', 
+						choices: ['same side as black dot','side opposite to the black dot'], 
+						description: 'On which side should histologyist cut sections: black dot side or opposite to black dot?'),
+                    choice(
+						name: 'ProcessingVendorName', 
+						choices: ['StanfordPC','PathXdx'], 
+						description: 'Who is the vendor these instructions are for (so we can use the right knife calibration)')
+                    ]) 
+					
+			//Get person who scanned name
+			def whoRanExperiment = params.WHO_TO_EMAIL_WHEN_DONE;
+			whoRanExperiment = whoRanExperiment.substring(0,whoRanExperiment.indexOf('@'))
+					
+			//Generate runme with data
+			bat("@echo subjectFolder_ = '" + SUBJECT_OUTPUT_FOLDER() + "'; > runme.m"); 
+			bat("@echo yourName_ = '" + whoRanExperiment + "'; >> runme.m")
+            bat("@echo processingVendorName_ = '" + userInput.ProcessingVendorName + "'; >> runme.m")
+			bat("@echo distanceToOCTOrigin_um_ = " + userInput.HowDeepUM + "; >> runme.m") 
+            bat("@echo isOverrideExistingInstructions_ = false; >> runme.m") 
+			
+			bat("@echo iteration_ = 1; >> runme.m") //First iteration
+			if (userInput.WhichSideToStartSections == "same side as black dot")
+			{
+				bat("@echo isCutOnDotSide_ = 1; >> runme.m")
+			}
+			else
+			{
+				bat("@echo isCutOnDotSide_ = -1; >> runme.m")
+			}
+			bat("@echo scriptGenerateHistologyInstructions; >> runme.m")
+			
+			RunMatlabRunme();
+			
+		}}}
+		stage("Save Log File")
+		{steps{script{
+			BackupLogFile();
+		}}}
+	}
+	post{ 
+		//Using ext-email plugin
+		success {
+			emailext (
+				subject: "[OCTHist] Scan ${currentBuild.result}",
+				from : "Yonatan",
+				body: "Scan is completed.<br>You can process the volume manualy to $TEMP_STORAGE\\$SAMPLE_ID and run bat file.<br> Or run automatically use <a href='http://localhost:9090/job/Upload%20to%20Cloud%20and%20Preprocess/'> Link </a>. <br> See log for more details <br>Yonatan<br><br>" + 
+					"<b>Print instructions for Pauline from attachement</b><br>"
+					,
+				attachLog: true,
+				attachmentsPattern: "Testers/HistologyInstructions.pdf",
+				to: "$WHO_TO_EMAIL_WHEN_DONE",
+				mimeType: "text/html")
+		} 
+		failure {
+			emailext (
+				subject: "[OCTHist] Scan ${currentBuild.result}",
+				from : "Yonatan",
+				body: "See log <br>Yonatan",
+				attachLog: true,
+				//attachmentsPattern: "Testers/*.png",
+				to: "$WHO_TO_EMAIL_WHEN_DONE",
+				mimeType: "text/html")
+		aborted {
+			emailext (
+				subject: "[OCTHist] Scan ${currentBuild.result}",
+				from : "Yonatan",
+				body: "See log<br>Be sure to kill Matlab (run by System) if its still running<br>Yonatan",
+				attachLog: true,
+				//attachmentsPattern: "Testers/*.png",
+				to: "$WHO_TO_EMAIL_WHEN_DONE",
+				mimeType: "text/html")
+			}
+		}
+	}
+}
+
+def SUBJECT_OUTPUT_FOLDER()
+{
+	return "${TEMP_STORAGE}\\${SAMPLE_ID}\\"
+}
+
+def LOG_OUTPUT_FOLDER()
+{
+	return  SUBJECT_OUTPUT_FOLDER() + "Log\\01 OCT Scan and Pattern\\"
+}
+
+def VOLUME_OUTPUT_FOLDER()
+{
+	return SUBJECT_OUTPUT_FOLDER() + "OCTVolumes\\"
+}
+
+def BackupLogFile()
+{
+	//Make sure folder exists
+	def logFolder = new File(LOG_OUTPUT_FOLDER())
+	if (!logFolder.exists()) {
+		bat ('mkdir "' + LOG_OUTPUT_FOLDER() + '"');
+	}
+	
+	//Save log file
+	def lg =currentBuild.rawBuild.getLog(10000);
+	lg = lg.join("\n");
+	lg = lg.replaceAll(env.JOB_URL,"http://localhost:NANA/job/");
+	lg = lg.replaceAll("@stanford.edu","");
+	def file = new File(LOG_OUTPUT_FOLDER() + "\\buildLog.txt")
+	file.write (lg)
+}
+
+def RunMatlabRunme() //runs runme.m
+{
+	try
+	{
+		def rootDir = pwd()
+		def MatlabRunner = load "${rootDir}/98 Jenkins Lib/MatlabRunner.Groovy"
+		MatlabRunner.RunMatlabScript ("runme.m");
+		bat("@del \f runme.m");
+	}
+	catch(Exception e)
+	{
+		currentBuild.result = 'FAILURE'
+		throw("Matlab Failed")
+	}
+}
